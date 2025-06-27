@@ -24,8 +24,6 @@ import org.apache.hc.client5.http.classic.methods.HttpGet;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.jline.utils.Log;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 
 public class RipeAtlasMeasurement {
@@ -196,6 +194,7 @@ public class RipeAtlasMeasurement {
                 activeMeasurements.decrementAndGet();
                 pb.step();
                 return;
+                //TODO: Sometimes the status seems to stay a few minutes at ongoing then goes to Stopped, maybe already consume ongoing messages if results are present
             } else if (status.equalsIgnoreCase("Stopped")) {
                 HttpGet get = new HttpGet(resultsUrl);
                 get.setHeader("Authorization", "Key " + apiKey);
@@ -205,6 +204,7 @@ public class RipeAtlasMeasurement {
                     JsonNode root = mapper.readTree(body);
                     if (root.isArray() && root.size() > 0) {
                         try {
+                            //TODO: Not all requested probes are actually approved. Add the missing probes to a buffer to retry
                             SQLiteConnector.saveResults(body);
                         } catch (Exception e) {
                             throw new RuntimeException(e);
@@ -237,7 +237,7 @@ public class RipeAtlasMeasurement {
 
                 while (true) {
                     int current = activeMeasurements.get();
-                    if (current >= CONCURRENT_MEASUREMENT_LIMIT) {
+                    if (current >= CONCURRENT_MEASUREMENT_LIMIT/BATCH_SIZE) {
                         try {
                             Thread.sleep(200);
                         } catch (InterruptedException e) {
@@ -251,6 +251,8 @@ public class RipeAtlasMeasurement {
                         break;
                     }
                 }
+
+                System.out.println(activeMeasurements.get());
 
                 if (j >= targets.size()) {
                     j -= targets.size();
