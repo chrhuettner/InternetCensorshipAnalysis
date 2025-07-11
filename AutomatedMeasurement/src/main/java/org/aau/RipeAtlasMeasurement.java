@@ -13,6 +13,7 @@ import org.apache.hc.core5.http.ContentType;
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.IOException;
+import java.net.InetAddress;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -42,6 +43,10 @@ public class RipeAtlasMeasurement {
 
     static HashMap<Integer, AtomicBoolean> targetsInActiveMeasurementMap = new HashMap<>();
     static ConcurrentHashMap<Long, Integer> measurementIdToMeasurementIndexMap = new ConcurrentHashMap<>();
+    static ConcurrentHashMap<Long, Map<String, Object>> measurementIndexToPayLoadMap = new ConcurrentHashMap<>();
+
+    static ConcurrentLinkedQueue<Map<String, Object>> residualMeasurements = new ConcurrentLinkedQueue<>();
+    static ConcurrentHashMap<Long, Integer> residualTargetsMap = new ConcurrentHashMap<Long, Integer>();
 
     // Extracted with CountryCodeFetcher
     static String[] countryCodesWithProbes = new String[]{"AD", "AE", "AF", "AL", "AM", "AO", "AR", "AT", "AU", "AX", "AZ",
@@ -53,7 +58,7 @@ public class RipeAtlasMeasurement {
             "MK", "ML", "MM", "MN", "MP", "MR", "MT", "MU", "MV", "MW", "MX", "MY", "MZ", "NA", "NC", "NG", "NI", "NL", "NO",
             "NP", "NZ", "OM", "PA", "PE", "PF", "PG", "PH", "PK", "PL", "PR", "PS", "PT", "PW", "PY", "QA", "RE", "RO", "RS",
             "RU", "RW", "SA", "SC", "SE", "SG", "SI", "SK", "SL", "SN", "SV", "TD", "TH", "TJ", "TL", "TN", "TO", "TR", "TT",
-            "TW", "TZ", "UA", "UG", "US", "UY", "UZ", "VA", "VE", "VI", "VN", "XK", "YE", "ZA", "ZM", "ZW"};
+            "TW", "TZ", "UA", "UG", "US", "UY", "UZ", "VA", "VE", "VI", "VN", "YE", "ZA", "ZM", "ZW"};
 
     static int BATCH_SIZE = Math.min(25, countryCodesWithProbes.length);
 
@@ -69,18 +74,23 @@ public class RipeAtlasMeasurement {
 
             String line;
 
-            for (int i = 0; (line = br.readLine()) != null; i++) {
+            int i = 0;
+            while ((line = br.readLine()) != null) {
                 if (line.startsWith("NOT_REACHABLE")) {
                     continue;
                 }
+                InetAddress address = InetAddress.getByName(line);
+                Log.info(line + ": " + address.getHostAddress());
+
                 Map<String, Object> definition = new HashMap<>();
                 definition.put("target", line);
-                definition.put("description", "Rank " + i);
+                definition.put("description", "" + i);
                 definition.put("type", "ping");
                 definition.put("af", 4);
                 definition.put("is_oneoff", true);
 
                 targets.add(definition);
+                i++;
             }
         } catch (IOException e) {
             throw new RuntimeException(e);
@@ -122,18 +132,20 @@ public class RipeAtlasMeasurement {
 
 
     public static List<Long> createMeasurements(int measurementIndex) {
-        String apiKey = System.getenv("RIPE_API_KEY");
-        if (apiKey == null || apiKey.isBlank()) {
-            throw new IllegalStateException("RIPE_API_KEY environment variable not set.");
-        }
-
-        String url = "https://atlas.ripe.net/api/v2/measurements/";
-
         int targetIndex = traversalOrder.get(measurementIndex).get(0);
         int countryCodeIndex = traversalOrder.get(measurementIndex).get(1);
 
         Map<String, Object> payload = generateDefinitionPayload(countryCodeIndex, targetIndex);
 
+        return sendMeasurements(measurementIndex, payload);
+    }
+
+    public static List<Long> sendMeasurements(int measurementIndex, Map<String, Object> payload) {
+        String apiKey = System.getenv("RIPE_API_KEY");
+        if (apiKey == null || apiKey.isBlank()) {
+            throw new IllegalStateException("RIPE_API_KEY environment variable not set.");
+        }
+        String url = "https://atlas.ripe.net/api/v2/measurements/";
         ObjectMapper mapper = new ObjectMapper();
         String json = null;
         try {
@@ -152,7 +164,7 @@ public class RipeAtlasMeasurement {
                 int status = response.getCode();
                 String responseBody = EntityUtils.toString(response.getEntity());
                 if (status != 201) {
-                    Log.error("Failed to create measurement. Target: " + targets.get(targetIndex).get("target") + " Country: " + countryCodesWithProbes[countryCodeIndex] + " Status " + status + ": " + responseBody);
+                    Log.error("Failed to create measurement. Status " + status + ": " + responseBody);
                     activeMeasurements.decrementAndGet();
                     return new ArrayList<>();
                 }
@@ -163,13 +175,9 @@ public class RipeAtlasMeasurement {
                 for (int i = 0; i < measurements.size(); i++) {
                     long id = measurements.get(i).asLong();
 
-                    for (int j = countryCodeIndex; j < Math.min(countryCodesWithProbes.length, countryCodeIndex + BATCH_SIZE); j++) {
-                        //TODO Fix this by dynamically accessing the ripe atlass api (now its lots of duplicates)
-                        SQLiteConnector.createMeasurementContext(id, (String) targets.get(targetIndex).get("target"), countryCodesWithProbes[j]);
-
-                    }
                     measurementIds.add(id);
                     measurementIdToMeasurementIndexMap.put(id, measurementIndex);
+                    measurementIndexToPayLoadMap.put(id, payload);
                 }
 
                 return measurementIds;
@@ -205,18 +213,30 @@ public class RipeAtlasMeasurement {
     }
 
 
-    public static void waitForResultAndSaveToDb(long measurementId, int timeoutIntMs, int intervalInMs, ProgressBar pb) throws Exception {
+    public static void waitForResultAndSaveToDb(long measurementId, int timeoutIntMs, int intervalInMs, ProgressBar pb) {
         String resultsUrl = "https://atlas.ripe.net/api/v2/measurements/" + measurementId + "/results/";
         ObjectMapper mapper = new ObjectMapper();
 
         int elapsed = 0;
 
         CloseableHttpClient client = HttpClients.createDefault();
-        AtomicBoolean targetIsInMeasurement = targetsInActiveMeasurementMap.get(traversalOrder.get(measurementIdToMeasurementIndexMap.get(measurementId)).get(0));
+
+        AtomicBoolean targetIsInMeasurement;
+        int measurementIndex = measurementIdToMeasurementIndexMap.get(measurementId);
+        if (measurementIndex < traversalOrder.size()) {
+            targetIsInMeasurement = targetsInActiveMeasurementMap.get(traversalOrder.get(measurementIndex).get(0));
+        } else {
+            targetIsInMeasurement = targetsInActiveMeasurementMap.get(residualTargetsMap.get(measurementId));
+        }
 
         while (elapsed < timeoutIntMs) {
 
-            String status = getMeasurementStatus(client, measurementId);
+            String status = null;
+            try {
+                status = getMeasurementStatus(client, measurementId);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
             if (status.equalsIgnoreCase("Failed") || status.equalsIgnoreCase("No suitable probes")) {
                 SQLiteConnector.saveFailedMeasurement(measurementId, "MEASUREMENT", status);
                 Log.info("Measurement " + measurementId + " failed.");
@@ -229,30 +249,70 @@ public class RipeAtlasMeasurement {
                 HttpGet get = new HttpGet(resultsUrl);
                 get.setHeader("Authorization", "Key " + apiKey);
 
-                String result = client.execute(get, (ClassicHttpResponse response) -> {
-                    String body = EntityUtils.toString(response.getEntity());
-                    JsonNode root = mapper.readTree(body);
-                    if (root.isArray() && root.size() > 0) {
-                        try {
-                            //TODO: Not all requested probes are actually approved. Add the missing probes to a buffer to retry
-                            SQLiteConnector.saveResults(body);
-                        } catch (Exception e) {
-                            throw new RuntimeException(e);
+                String result = null;
+                try {
+                    result = client.execute(get, (ClassicHttpResponse response) -> {
+                        String body = EntityUtils.toString(response.getEntity());
+                        JsonNode root = mapper.readTree(body);
+                        if (root.isArray() && root.size() > 0) {
+                            try {
+                                JsonNode resultsArray = mapper.readTree(body);
+                                List<Integer> probesInResult = new ArrayList<>();
+                                Map<String, Object> payload = measurementIndexToPayLoadMap.get(measurementId);
+                                List<Map<String, Object>> probes = (List<Map<String, Object>>) payload.get("probes");
+
+                                for (JsonNode obj : resultsArray) {
+                                    probesInResult.add(obj.path("prb_id").asInt());
+                                }
+
+                                if (probesInResult.size() != probes.size()) {
+                                    List<String> countriesOfProbes = new ArrayList<>();
+
+
+                                    for (int i = 0; i < probesInResult.size(); i++) {
+                                        countriesOfProbes.add(SQLiteConnector.getCountryForProbe(probesInResult.get(i)));
+                                    }
+
+                                    int initialSize = probes.size();
+
+                                    // Remove probes from payload where we already got a result and reschedule the measurement
+                                    for (int i = probes.size() - 1; i >= 0; i--) {
+                                        String country = probes.get(i).get("value").toString();
+
+                                        if (countriesOfProbes.contains(country)) {
+                                            probes.remove(i);
+                                        }
+                                    }
+
+                                    Log.info("Rescheduling remaining probes of measurement " + measurementId + " because ripe atlas only provided " + countriesOfProbes.size() + " out of " + initialSize + " probes");
+
+                                    residualMeasurements.add(payload);
+                                }
+                                SQLiteConnector.saveResults(body);
+                            } catch (Exception e) {
+                                throw new RuntimeException(e);
+                            }
+                            pb.step();
+                            activeMeasurements.decrementAndGet();
+                            targetIsInMeasurement.set(false);
+                            return body;
                         }
-                        pb.step();
-                        activeMeasurements.decrementAndGet();
-                        targetIsInMeasurement.set(false);
-                        return body;
-                    }
-                    return null;
-                });
+                        return null;
+                    });
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
 
                 if (result != null) {
                     return;
                 }
             }
 
-            Thread.sleep(intervalInMs);
+            try {
+                Thread.sleep(intervalInMs);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
             elapsed += intervalInMs;
         }
 
@@ -264,7 +324,7 @@ public class RipeAtlasMeasurement {
     public static Thread startAsynchronousMeasurementThread(ProgressBar pb, ConcurrentLinkedQueue<Long> measurementIds) {
         activeMeasurementThreads.incrementAndGet();
         return Thread.startVirtualThread(() -> {
-            Log.info("Thread " + Thread.currentThread().getName() + " started");
+            //Log.info("Thread " + Thread.currentThread().getName() + " started");
 
             while (true) {
                 int measurementIndex = traversalIndex.getAndUpdate((t) -> {
@@ -273,11 +333,27 @@ public class RipeAtlasMeasurement {
                     }
                     return t;
                 });
+                boolean isResidual = false;
+                Map<String, Object> payload = Map.of();
                 if (measurementIndex >= traversalOrder.size()) {
-                    break;
+                    payload = residualMeasurements.poll();
+                    if (payload != null) {
+                        isResidual = true;
+                    } else {
+                        if (activeMeasurements.get() == 0) {
+                            break;
+                        }
+
+                        try {
+                            Thread.sleep(2000);
+                        } catch (InterruptedException e) {
+                            throw new RuntimeException(e);
+                        }
+                        continue;
+                    }
                 }
 
-                Log.info("Thread " + Thread.currentThread().getName() + " aquired measurement index " + measurementIndex);
+                //Log.info("Thread " + Thread.currentThread().getName() + " aquired measurement index " + measurementIndex);
 
                 while (true) {
                     int current = activeMeasurements.get();
@@ -296,13 +372,21 @@ public class RipeAtlasMeasurement {
                         break;
                     }
                 }
+                AtomicBoolean targetIsInMeasurement;
+                if (isResidual) {
+                    Map<String, Object> targets = ((List<Map<String, Object>>) payload.get("definitions")).get(0);
+                    int targetIndex = Integer.parseInt((String) targets.get("description"));
 
-                AtomicBoolean targetIsInMeasurement = targetsInActiveMeasurementMap.get(traversalOrder.get(measurementIndex).get(0));
+                    targetIsInMeasurement = targetsInActiveMeasurementMap.get(targetIndex);
+                } else {
+                    targetIsInMeasurement = targetsInActiveMeasurementMap.get(traversalOrder.get(measurementIndex).get(0));
+
+                }
 
 
                 while (true) {
                     if (targetIsInMeasurement.get()) {
-                        Log.info("Target of measurement " + measurementIndex + " is already in an active measurement, waiting for completion of measurement...");
+                        //Log.info("Target of measurement " + measurementIndex + " is already in an active measurement, waiting for completion of measurement...");
                         try {
                             Thread.sleep(2000);
                         } catch (InterruptedException e) {
@@ -315,8 +399,17 @@ public class RipeAtlasMeasurement {
                         break;
                     }
                 }
-
-                measurementIds.addAll(createMeasurements(measurementIndex));
+                if (isResidual) {
+                    Map<String, Object> targets = ((List<Map<String, Object>>) payload.get("definitions")).get(0);
+                    int targetIndex = Integer.parseInt((String) targets.get("description"));
+                    List<Long> newMeasurementIds = sendMeasurements(measurementIndex, payload);
+                    for (int i = 0; i < newMeasurementIds.size(); i++) {
+                        residualTargetsMap.put(newMeasurementIds.get(i), targetIndex);
+                    }
+                    measurementIds.addAll(newMeasurementIds);
+                } else {
+                    measurementIds.addAll(createMeasurements(measurementIndex));
+                }
                 pb.step();
             }
 
@@ -379,6 +472,7 @@ public class RipeAtlasMeasurement {
         }
     }
 
+
     public static void main(String[] args) throws Exception {
         Log.info("Starting Ripe Atlas measurement");
         List<Thread> startingThreads = new ArrayList<>();
@@ -403,11 +497,7 @@ public class RipeAtlasMeasurement {
                 }
                 long id = measurementIds.poll();
                 Thread thread = Thread.startVirtualThread(() -> {
-                    try {
-                        waitForResultAndSaveToDb(id, 600000, 2000, pb);
-                    } catch (Exception e) {
-                        throw new RuntimeException(e);
-                    }
+                    waitForResultAndSaveToDb(id, 600000, 2000, pb);
                 });
                 threads.add(thread);
             }
