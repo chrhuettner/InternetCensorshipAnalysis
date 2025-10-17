@@ -125,7 +125,8 @@ public class RipeAtlasMeasurement {
         payload.put("definitions", List.of(targets.get(targetIndex)));
         payload.put("probes", probeList);
 
-        Log.info("Generated payload for target " + targetIndex + " and countries from index " + startCountryIndex + " until " + Math.min(countryCodesWithProbes.length, startCountryIndex + BATCH_SIZE));
+        Log.info("Generated payload for target " + targetIndex + " and countries from index " +
+                startCountryIndex + " until " + Math.min(countryCodesWithProbes.length, startCountryIndex + BATCH_SIZE));
 
         return payload;
     }
@@ -386,7 +387,6 @@ public class RipeAtlasMeasurement {
 
                 while (true) {
                     if (targetIsInMeasurement.get()) {
-                        //Log.info("Target of measurement " + measurementIndex + " is already in an active measurement, waiting for completion of measurement...");
                         try {
                             Thread.sleep(2000);
                         } catch (InterruptedException e) {
@@ -439,7 +439,7 @@ public class RipeAtlasMeasurement {
             measurementIndex.add(i % rows);
             measurementIndex.add((batchCounter % batchesInRow) * BATCH_SIZE);
 
-            //Log.info(i % rows + " " + ((batchCounter % batchesInRow) * BATCH_SIZE));
+            System.out.println(i % rows + " " + ((batchCounter % batchesInRow) * BATCH_SIZE));
             measurementIndices.add(measurementIndex);
             batchCounter++;
 

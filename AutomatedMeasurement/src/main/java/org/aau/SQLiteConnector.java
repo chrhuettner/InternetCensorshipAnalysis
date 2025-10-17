@@ -118,30 +118,48 @@ public class SQLiteConnector {
             throw new RuntimeException(e);
         }
     }
+
     public static void attachUrlToDB(HashMap<String, String> urlMap) {
         Connection conn = getConn();
-        String selectSQL = "SELECT id, dst_addr FROM measurement_results group by dst_addr";
+        try {
+
+            for (String dst_addr : urlMap.keySet()) {
+                String updateSQL = "UPDATE measurement_results SET dst_name = ? WHERE dst_addr = ?";
+                String url = urlMap.get(dst_addr);
+                PreparedStatement updateStmt = conn.prepareStatement(updateSQL);
+                updateStmt.setString(1, url);
+                updateStmt.setString(2, dst_addr);
+                updateStmt.executeUpdate();
+            }
+
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static HashMap<Integer, String> getTargetAddresses() {
+        HashMap<Integer, String> targetAddresses = new HashMap<>();
+        Connection conn = getConn();
+        String selectSQL = "SELECT msm_id, dst_addr FROM measurement_results group by dst_addr";
         PreparedStatement selectStmt = null;
         try {
             selectStmt = conn.prepareStatement(selectSQL);
 
             ResultSet rs = selectStmt.executeQuery();
 
-            String updateSQL = "UPDATE measurement_results SET dst_name = ? WHERE id = ?";
 
             while (rs.next()) {
-                int id = rs.getInt("id");
+                int id = rs.getInt("msm_id");
                 String dst_addr = rs.getString("dst_addr");
 
-                String url = urlMap.get(dst_addr);
-                PreparedStatement updateStmt = conn.prepareStatement(updateSQL);
-                updateStmt.setString(1, url);
-                updateStmt.setInt(2, id);
-                updateStmt.executeUpdate();
+                targetAddresses.put(id, dst_addr);
+
             }
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
+
+        return targetAddresses;
     }
 
     public static void attachCountryInformationToDB() {
